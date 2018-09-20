@@ -1,0 +1,1054 @@
+diff -ruN ns-2.35/common/packet.h /home/jesson/workspace/NS_CODE/Homa/ns-allinone-2.35/ns-2.35/common/packet.h
+--- ns-2.35/common/packet.h	2010-05-10 06:28:41.000000000 +0800
++++ /home/jesson/workspace/NS_CODE/Homa/ns-allinone-2.35/ns-2.35/common/packet.h	2018-09-09 07:40:31.708983688 +0800
+@@ -599,6 +599,7 @@
+ struct hdr_cmn {
+ 	enum dir_t { DOWN= -1, NONE= 0, UP= 1 };
+ 	packet_t ptype_;	// packet type (see above)
++	short	ppri_;		// Jesson LIU, for the priorities in Homa
+ 	int	size_;		// simulated packet size
+ 	int	uid_;		// unique id
+ 	int	error_;		// error flag
+@@ -651,6 +652,7 @@
+ 	
+         /* per-field member functions */
+ 	inline packet_t& ptype() { return (ptype_); }
++	inline short& ppri() {return (ppri_);}
+ 	inline int& size() { return (size_); }
+ 	inline int& uid() { return (uid_); }
+ 	inline int& error() { return error_; }
+@@ -715,6 +717,9 @@
+ 	/* setting all direction of pkts to be downward as default; 
+ 	   until channel changes it to +1 (upward) */
+ 	p->next_ = 0;
++
++	(HDR_CMN(p))->ppri() = 0;	//Jesson Liu, highest priority by default
++
+ 	return (p);
+ }
+ 
+diff -ruN ns-2.35/Makefile.in /home/jesson/workspace/NS_CODE/Homa/ns-allinone-2.35/ns-2.35/Makefile.in
+--- ns-2.35/Makefile.in	2011-10-24 00:29:54.000000000 +0800
++++ /home/jesson/workspace/NS_CODE/Homa/ns-allinone-2.35/ns-2.35/Makefile.in	2018-09-09 04:04:54.796942903 +0800
+@@ -217,6 +217,7 @@
+ 	tools/integrator.o tools/queue-monitor.o \
+ 	tools/flowmon.o tools/loss-monitor.o \
+ 	queue/queue.o queue/drop-tail.o \
++	queue/homa_priqueue.o \
+ 	adc/simple-intserv-sched.o queue/red.o \
+ 	queue/semantic-packetqueue.o queue/semantic-red.o \
+ 	tcp/ack-recons.o \
+diff -ruN ns-2.35/queue/homa_priqueue.cc /home/jesson/workspace/NS_CODE/Homa/ns-allinone-2.35/ns-2.35/queue/homa_priqueue.cc
+--- ns-2.35/queue/homa_priqueue.cc	1970-01-01 08:00:00.000000000 +0800
++++ /home/jesson/workspace/NS_CODE/Homa/ns-allinone-2.35/ns-2.35/queue/homa_priqueue.cc	2018-09-20 05:52:17.603959454 +0800
+@@ -0,0 +1,143 @@
++/* -*-  Mode:C++; c-basic-offset:8; tab-width:8; indent-tabs-mode:t -*- */
++/*
++ * Copyright (c) 1994 Regents of the University of California.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 3. All advertising materials mentioning features or use of this software
++ *    must display the following acknowledgement:
++ *      This product includes software developed by the Computer Systems
++ *      Engineering Group at Lawrence Berkeley Laboratory.
++ * 4. Neither the name of the University nor of the Laboratory may be used
++ *    to endorse or promote products derived from this software without
++ *    specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ *
++ * @(#) $Header: /cvsroot/nsnam/ns-2/queue/homa_priqueue.cc,v 1.19 2018/09/05 15:05:07 haldar Exp $ (LBL)
++ */
++
++/*
++ * @author Jesson Liu
++ */
++
++#include "homa_priqueue.h"
++#include "tcp.h"
++#include "flags.h"
++#include "math.h"
++#include "random.h"
++
++#define max(arg1, arg2) (arg1>arg2 ? arg1 : arg2)
++#define min(arg1, arg2) (arg1<arg2 ? arg1 : arg2)
++
++static class Homa_PriQueueClass : public TclClass {
++
++public:
++	Homa_PriQueueClass() : TclClass("Queue/Homa_PriQueue") {}
++	TclObject* create(int, const char*const*) {
++		return (new Homa_PriQueue);
++	}
++} class_ndp_priqueue;
++
++void Homa_PriQueue::enque(Packet* p) {
++
++	int qlimBytes = qlim_/MAX_QUEUE_NUM*mean_pktsize_;		// two queues share the buffer equally
++	packet_t isAck = hdr_cmn::access(p)->ptype();
++	short prio = hdr_cmn::access(p)->ppri();
++	int hdr_len = hdr_cmn::access(p)->size()-1460;
++	
++	if(isAck == PT_ACK){
++		
++		prio = 0;
++		if((TotalByteLength()+40)>(qlim_*mean_pktsize_)){
++			
++			drop(p);
++			return;
++		}
++	}else{
++
++		if(prio<8 && prio>=0){
++
++			//-----non-shared buffer-------
++//			if(getQueueByteLength(prio)+hdr_cmn::access(p)->size()>qlimBytes){
++//				
++//				drop(p);
++//				return;
++//			}
++
++			//-----shared buffer------
++			if(TotalByteLength()+hdr_cmn::access(p)->size()>(qlim_*mean_pktsize_)){
++				
++/*				if(isAck==PT_TCP){
++					hdr_tcp *tcph = hdr_tcp::access(p);
++					printf("qid: %d, len: %d, seqno: %d dropped\n",this->self_id_, TotalByteLength(), tcph->seqno());
++//					this->pkt_through_++;
++				}*/
++				drop(p);
++				return;
++			}
++			
++		}else{
++			drop(p);
++			printf("error packet priorities!\n");
++			return;
++		}
++	}
++	q_[prio]->enque(p);
++	/*if(isAck==PT_TCP){
++		this->pkt_through_++;
++	}*/
++	/* print queue length. Comment it if not to use this printing*/
++	/*if(this->self_id_==0){
++		double now = Scheduler::instance().clock();
++		float percentage = (float)((float)TotalByteLength()/((float)qlim_*mean_pktsize_)*100);
++		printf("%lf	%lf\n", now, percentage);
++	}*/
++}
++
++Packet* Homa_PriQueue::deque(){
++
++	if(TotalByteLength()>0){
++		
++/*		printf("\n");
++		double now = Scheduler::instance().clock();
++		printf("------queue id: %d @%lf --------\n", self_id_, now);
++*/
++		for(int i=0; i<MAX_QUEUE_NUM; i++){
++			
++			if(q_[i]->length()>0){
++
++/*				for(int k=0; k<q_[i]->length(); k++){
++					Packet* tempp = q_[i]->lookup(k);
++					printf("%d, UDP:%d, TCP:%d\n", hdr_cmn::access(tempp)->ptype(), PT_UDP, PT_TCP);
++				}
++*/
++				Packet* p = q_[i]->deque();
++				packet_t type = hdr_cmn::access(p)->ptype();
++				/*if(type==PT_TCP){
++					printf("qid: %d received %d pkts so far\n", self_id_, pkt_through_);
++				}*/
++				return p;
++			}
++		}
++	}
++	return NULL;
++}
++
+diff -ruN ns-2.35/queue/homa_priqueue.h /home/jesson/workspace/NS_CODE/Homa/ns-allinone-2.35/ns-2.35/queue/homa_priqueue.h
+--- ns-2.35/queue/homa_priqueue.h	1970-01-01 08:00:00.000000000 +0800
++++ /home/jesson/workspace/NS_CODE/Homa/ns-allinone-2.35/ns-2.35/queue/homa_priqueue.h	2018-09-19 04:53:53.383676021 +0800
+@@ -0,0 +1,119 @@
++/* -*-  Mode:C++; c-basic-offset:8; tab-width:8; indent-tabs-mode:t -*- */
++/*
++ * Copyright (c) 1994 Regents of the University of California.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 3. All advertising materials mentioning features or use of this software
++ *    must display the following acknowledgement:
++ *      This product includes software developed by the Computer Systems
++ *      Engineering Group at Lawrence Berkeley Laboratory.
++ * 4. Neither the name of the University nor of the Laboratory may be used
++ *    to endorse or promote products derived from this software without
++ *    specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ *
++ * @(#) $Header: /cvsroot/nsnam/ns-2/queue/homa_priqueue.h,v 1.19 2018/09/05 14:25:37 haldar Exp $ (LBL)
++ */
++
++/*
++ * @author Jesson Liu
++ */
++
++#ifndef ns_homa_priqueue_h
++#define ns_homa_priqueue_h
++
++#define MAX_QUEUE_NUM 8
++
++#include <string.h>
++#include "queue.h"
++#include "config.h"
++
++int homa_priqueue_counter_=0;
++
++class Homa_PriQueue : public Queue {
++
++public:
++	Homa_PriQueue(){
++		
++		queue_num_=MAX_QUEUE_NUM;
++		//thresh_=65;
++		pkt_through_ = 0;
++		mean_pktsize_=1500;
++
++		self_id_ = homa_priqueue_counter_++;
++
++		//bind("queue_num_", &queue_num_);
++		//bind("thresh_", &thresh_);
++		//bind("mean_pktsize_", &mean_pktsize_);
++
++		q_=new PacketQueue*[MAX_QUEUE_NUM];
++		for(int i=0; i<MAX_QUEUE_NUM; i++){
++		
++			q_[i]=new PacketQueue;
++		}
++		
++	}
++
++	~Homa_PriQueue(){
++		
++		for(int i=0; i<MAX_QUEUE_NUM; i++){
++
++			delete q_[i];
++		}
++
++		delete[] q_;
++	}
++
++protected:
++	void enque(Packet*);
++	Packet* deque();
++
++	PacketQueue **q_;
++	int mean_pktsize_;
++	int queue_num_;
++
++	int pkt_through_;
++	int self_id_;
++
++	int TotalByteLength(){
++
++		int byte_length = 0;
++		for(int i=0; i<MAX_QUEUE_NUM; i++){
++			byte_length += q_[i]->byteLength();
++		}
++
++		return byte_length;
++	}
++
++	int getQueueByteLength(int index){
++
++		if(index > 7 || index < 0){
++			
++			return -1;
++		}
++	
++		return q_[index]->byteLength();
++	}
++
++};
++
++#endif
+diff -ruN ns-2.35/tcl/lib/ns-default.tcl /home/jesson/workspace/NS_CODE/Homa/ns-allinone-2.35/ns-2.35/tcl/lib/ns-default.tcl
+--- ns-2.35/tcl/lib/ns-default.tcl	2010-07-04 06:45:45.000000000 +0800
++++ /home/jesson/workspace/NS_CODE/Homa/ns-allinone-2.35/ns-2.35/tcl/lib/ns-default.tcl	2018-09-20 01:47:55.223913230 +0800
+@@ -900,6 +900,11 @@
+ Agent/SCTP/CMT set countPFToActiveRtxms_ 0;   # count of PF->Active changes
+                                               # for retransmissions
+ 
++## Jesson LIU
++Agent/TCP set fullrate_ 12;		# 1Gbps, 100us RTT, 8 pkts/RTT
++Agent/TCP set initial_fullrate_ 12;	# the initial value of fullrate, fullrate_ is changable during transmission
++Agent/TCP set flowsize_ -1;		# -1 means no completion time printing
++
+ Agent/TCP set seqno_ 0
+ Agent/TCP set t_seqno_ 0
+ Agent/TCP set maxburst_ 0
+@@ -1048,6 +1053,30 @@
+ Agent/TCP set sfrto_enabled_	0 ;	# Added on 2004/10/26 for F-RTO
+ Agent/TCP set spurious_response_ 1 ;	# Added on 2004/10/26 for F-RTO
+ 
++## Jesson LIU, for Homa. NOTE: the unit is pkt, not bytes
++Agent/TCP set th0_ [expr 50];
++Agent/TCP set th1_ [expr 100];
++Agent/TCP set th2_ [expr 200];
++Agent/TCP set th3_ [expr 500];
++Agent/TCP set th4_ [expr 1000];
++Agent/TCP set th5_ [expr 2000];
++Agent/TCP set th6_ [expr 5000];
++Agent/TCP set th7_ [expr 10*1000];
++
++## Jesson LIU, for Homa. NOTE: the unit is pkt, not bytes
++Agent/TCPSink set th0_ [expr 50];
++Agent/TCPSink set th1_ [expr 100];
++Agent/TCPSink set th2_ [expr 200];
++Agent/TCPSink set th3_ [expr 500];
++Agent/TCPSink set th4_ [expr 1000];
++Agent/TCPSink set th5_ [expr 2000];
++Agent/TCPSink set th6_ [expr 5000];
++Agent/TCPSink set th7_ [expr 10*1000];
++
++# Jesson
++Agent/TCPSink set pull_interval_ 0.000012;	# 1Gbps, 1500Bytes*8/1Gbps
++Agent/TCPSink set nid_	-1;			# shared node
++
+ Agent/TCPSink set sport_        0
+ Agent/TCPSink set dport_        0         
+ 
+diff -ruN ns-2.35/tcp/tcp.cc /home/jesson/workspace/NS_CODE/Homa/ns-allinone-2.35/ns-2.35/tcp/tcp.cc
+--- ns-2.35/tcp/tcp.cc	2011-06-20 12:51:46.000000000 +0800
++++ /home/jesson/workspace/NS_CODE/Homa/ns-allinone-2.35/ns-2.35/tcp/tcp.cc	2018-09-20 06:24:55.987965628 +0800
+@@ -76,7 +76,8 @@
+ 	  first_decrease_(1), fcnt_(0), nrexmit_(0), restart_bugfix_(1), 
+           cong_action_(0), ecn_burst_(0), ecn_backoff_(0), ect_(0), 
+           use_rtt_(0), qs_requested_(0), qs_approved_(0),
+-	  qs_window_(0), qs_cwnd_(0), frto_(0)
++	  qs_window_(0), qs_cwnd_(0), frto_(0),
++		printful_(1) 		//Jesson
+ {
+ #ifdef TCP_DELAY_BIND_ALL
+         // defined since Dec 1999.
+@@ -101,6 +102,21 @@
+         bind("necnresponses_", &necnresponses_);
+         bind("ncwndcuts_", &ncwndcuts_);
+ 	bind("ncwndcuts1_", &ncwndcuts1_);
++
++	// Jesson LIU, for Homa
++	bind("th0_", &th0_);
++	bind("th1_", &th1_);
++	bind("th2_", &th2_);
++	bind("th3_", &th3_);
++	bind("th4_", &th4_);
++	bind("th5_", &th5_);
++	bind("th6_", &th6_);
++	bind("th7_", &th7_);
++
++	bind("fullrate_", &fullrate_);		// Jesson LIU
++	bind("flowsize_", &flowsize_);
++	bind("initial_fullrate_", &initial_fullrate_);
++
+ #endif /* TCP_DELAY_BIND_ALL */
+ 
+ }
+@@ -190,6 +206,20 @@
+ 	delay_bind_init_one("sfrto_enabled_");
+ 	delay_bind_init_one("spurious_response_");
+ 
++	// Jesson LIU, for Homa
++	delay_bind_init_one("th0_");
++	delay_bind_init_one("th1_");
++	delay_bind_init_one("th2_");
++	delay_bind_init_one("th3_");
++	delay_bind_init_one("th4_");
++	delay_bind_init_one("th5_");
++	delay_bind_init_one("th6_");
++	delay_bind_init_one("th7_");
++
++	delay_bind_init_one("fullrate_");		// Jesson LIU
++	delay_bind_init_one("flowsize_");
++	delay_bind_init_one("initial_fullrate_");
++	
+ #ifdef TCP_DELAY_BIND_ALL
+ 	// out because delay-bound tracevars aren't yet supported
+         delay_bind_init_one("t_seqno_");
+@@ -301,6 +331,21 @@
+ 	if (delay_bind_bool(varName, localName, "sfrto_enabled_", &sfrto_enabled_, tracer)) return TCL_OK;
+ 	if (delay_bind_bool(varName, localName, "spurious_response_", &spurious_response_, tracer)) return TCL_OK;
+ 
++	// Jesson LIU, for Homa
++	if (delay_bind(varName, localName, "th0_", &th0_, tracer)) return TCL_OK;
++	if (delay_bind(varName, localName, "th1_", &th1_, tracer)) return TCL_OK;
++	if (delay_bind(varName, localName, "th2_", &th2_, tracer)) return TCL_OK;
++	if (delay_bind(varName, localName, "th3_", &th3_, tracer)) return TCL_OK;
++	if (delay_bind(varName, localName, "th4_", &th4_, tracer)) return TCL_OK;
++	if (delay_bind(varName, localName, "th5_", &th5_, tracer)) return TCL_OK;
++	if (delay_bind(varName, localName, "th6_", &th6_, tracer)) return TCL_OK;
++	if (delay_bind(varName, localName, "th7_", &th7_, tracer)) return TCL_OK;
++
++	// Jesson
++	if (delay_bind(varName, localName, "fullrate_", &fullrate_, tracer)) return TCL_OK;
++	if (delay_bind(varName, localName, "flowsize_", &flowsize_, tracer)) return TCL_OK;
++	if (delay_bind(varName, localName, "initial_fullrate_", &initial_fullrate_, tracer)) return TCL_OK;
++
+ #ifdef TCP_DELAY_BIND_ALL
+ 	// not if (delay-bound delay-bound tracevars aren't yet supported
+         if (delay_bind(varName, localName, "t_seqno_", &t_seqno_ , tracer)) return TCL_OK;
+@@ -648,6 +693,17 @@
+ {
+ 	int force_set_rtx_timer = 0;
+ 	Packet* p = allocpkt();
++
++	// Jesson, for priority initialization
++	hdr_cmn *cmnh = hdr_cmn::access(p);
++	if(this->flowsize_>0){
++		cmnh->ppri() = this->getPriority(this->flowsize_/1460-highest_ack_);
++	}else{
++		cmnh->ppri() = 0;
++	}
++	//double now = Scheduler::instance().clock();
++	//printf("%lf: %d-%d @ fullrate_:%d, highest_ack_:%d\n", now, this->fid_, seqno, this->fullrate_, (int)this->highest_ack_);
++
+ 	hdr_tcp *tcph = hdr_tcp::access(p);
+ 	hdr_flags* hf = hdr_flags::access(p);
+ 	hdr_ip *iph = hdr_ip::access(p);
+@@ -913,7 +969,9 @@
+ void TcpAgent::send_much(int force, int reason, int maxburst)
+ {
+ 	send_idle_helper();
+-	int win = window();
++	//int win = window();
++	int win = fullrate_;	// @author Jesson LIU, for full link rate transmission of Homa
++
+ 	int npackets = 0;
+ 
+ 	if (!force && delsnd_timer_.status() == TIMER_PENDING)
+@@ -948,7 +1006,9 @@
+ 			delsnd_timer_.resched(Random::uniform(overhead_));
+ 			return;
+ 		}
+-		win = window();
++
++		// Jesson, 'win' always equals 10
++//		win = window();
+ 		if (maxburst && npackets == maxburst)
+ 			break;
+ 	}
+@@ -1363,6 +1423,8 @@
+ 	prev_highest_ack_ = highest_ack_ ;
+ 	highest_ack_ = last_ack_;
+ 
++	//restorePullPkts();		// Jesson, restore one pull pkt when a new ack received.
++
+ 	if (t_seqno_ < last_ack_ + 1)
+ 		t_seqno_ = last_ack_ + 1;
+ 	/* 
+@@ -1575,8 +1637,10 @@
+ void
+ TcpAgent::send_one()
+ {
+-	if (t_seqno_ <= highest_ack_ + wnd_ && t_seqno_ < curseq_ &&
+-		t_seqno_ <= highest_ack_ + cwnd_ + dupacks_ ) {
++	int win = this->fullrate_; // Jesson, a new send one condition
++	//if (t_seqno_ <= highest_ack_ + wnd_ && t_seqno_ < curseq_ &&
++	//	t_seqno_ <= highest_ack_ + cwnd_ + dupacks_ ) {
++	if (t_seqno_ <= highest_ack_ + win + dupacks_ && t_seqno_ < curseq_) {
+ 		output(t_seqno_, 0);
+ 		if (QOption_)
+ 			process_qoption_after_send () ;
+@@ -1847,6 +1911,7 @@
+ 	 	* delayed-send timer, with random overhead
+ 	 	* to avoid phase effects
+ 	 	*/
++		resetPullPkts();		// Jesson, for Homa. Handling timeout
+ 		send_much(1, TCP_REASON_TIMEOUT, maxburst_);
+ 	}
+ }
+@@ -1924,6 +1989,7 @@
+ 			reset_rtx_timer(0,1);
+ 		}
+ 		last_cwnd_action_ = CWND_ACTION_TIMEOUT;
++		resetPullPkts();		// Jesson, for Homa. Handling timeout
+ 		send_much(0, TCP_REASON_TIMEOUT, maxburst_);
+ 	} 
+ 	else {
+@@ -2204,3 +2270,29 @@
+ 			);
+ 	et_->trace();
+ }
++
++// Jesson LIU, for Homa
++short TcpAgent::getPriority(int pkts){
++	
++	short pri = 0;
++
++	if(pkts<this->th0_){
++		pri = 0;
++	}else if(pkts>this->th0_ && pkts<this->th1_){
++		pri = 1;
++	}else if(pkts>this->th1_ && pkts<this->th2_){
++		pri = 2;
++	}else if(pkts>this->th2_ && pkts<this->th3_){
++		pri = 3;
++	}else if(pkts>this->th3_ && pkts<this->th4_){
++		pri = 4;
++	}else if(pkts>this->th4_ && pkts<this->th5_){
++		pri = 5;
++	}else if(pkts>this->th5_ && pkts<this->th6_){
++		pri = 6;
++	}else{
++		pri = 7;
++	}
++
++	return pri;
++}
+diff -ruN ns-2.35/tcp/tcp.h /home/jesson/workspace/NS_CODE/Homa/ns-allinone-2.35/ns-2.35/tcp/tcp.h
+--- ns-2.35/tcp/tcp.h	2011-08-27 03:29:57.000000000 +0800
++++ /home/jesson/workspace/NS_CODE/Homa/ns-allinone-2.35/ns-2.35/tcp/tcp.h	2018-09-20 04:46:49.775947071 +0800
+@@ -288,6 +288,29 @@
+ 	virtual void rtt_backoff();		/* double multiplier */
+ 	/* End of state for the round-trip-time estimate. */
+ 
++	/* @author Jesson LIU, for Homa implementation
++	 * the thresholds for priorities
++	 */
++	int th0_;
++	int th1_;
++	int th2_;
++	int th3_;
++	int th4_;
++	int th5_;
++	int th6_;
++	int th7_;
++
++	short getPriority(int);
++
++	int fullrate_;		/* the link rate that Homa can use */
++	int initial_fullrate_;	/* the inital rate that Homa can use */
++	int flowsize_;		/* the size of a flow, to print the finish time of this flow*/
++	short printful_;	/* for printing completion time only once*/
++	
++	void restorePullPkts() { this->fullrate_ = ++(this->fullrate_) > this->initial_fullrate_ ? this->initial_fullrate_ : this->fullrate_; }
++	void consumePullPkts() { this->fullrate_ = --(this->fullrate_)<0 ? 0 : this->fullrate_; }
++	void resetPullPkts() { this->fullrate_ = this->initial_fullrate_; }
++
+         /* RTOs: */
+ 	double maxrto_;		/* max value of an RTO */
+ 	double minrto_;         /* min value of an RTO */
+diff -ruN ns-2.35/tcp/tcp-newreno.cc /home/jesson/workspace/NS_CODE/Homa/ns-allinone-2.35/ns-2.35/tcp/tcp-newreno.cc
+--- ns-2.35/tcp/tcp-newreno.cc	2009-12-31 06:06:34.000000000 +0800
++++ /home/jesson/workspace/NS_CODE/Homa/ns-allinone-2.35/ns-2.35/tcp/tcp-newreno.cc	2018-09-20 06:15:52.331963914 +0800
+@@ -80,6 +80,9 @@
+ 	}
+ 	last_ack_ = tcph->seqno();
+ 	highest_ack_ = last_ack_;
++
++//	restorePullPkts();		// Jesson, restore one pull pkt when a new ack received.
++	
+ 	if (t_seqno_ < last_ack_ + 1)
+ 		t_seqno_ = last_ack_ + 1;
+ 	if (rtt_active_ && tcph->seqno() >= rtt_seq_) {
+@@ -102,6 +105,7 @@
+ 	}
+ 	partialnewack(pkt);
+ 	output(last_ack_ + 1, 0);
++	consumePullPkts();              // Jesson, consume one pull packet per one retransmission
+ }
+ 
+ int
+@@ -145,6 +149,7 @@
+                  */
+                 reset_rtx_timer(1,0);
+                 output(last_ack_ + 1, TCP_REASON_DUPACK);
++		consumePullPkts();              // Jesson, consume one pull packet per one retransmission
+ 		dupwnd_ = numdupacks_;
+                 return;
+         }
+@@ -171,6 +176,7 @@
+         	last_cwnd_action_ = CWND_ACTION_DUPACK;
+         	slowdown(CLOSE_SSTHRESH_HALF|CLOSE_CWND_HALF);
+         	output(last_ack_ + 1, TCP_REASON_DUPACK);       // from top
++		consumePullPkts();              // Jesson, consume one pull packet per one retransmission
+ 		dupwnd_ = numdupacks_;
+ 	}
+         return;
+@@ -210,6 +216,21 @@
+ 		exit(1);
+ 	}
+ #endif
++
++	// Jesson, for debugging
++        //double now = Scheduler::instance().clock();
++        //printf("%lf: %d- @ highest_ack_:%d\n", now, this->fid_, (int)this->highest_ack_);
++
++	/* Jesson, to print the completion time of flows. But flow size need to be greater than 0,
++	 * which means no completion time printing by default.
++	 */
++	if(((int)highest_ack_+1)>=(flowsize_/1460) && flowsize_>0 && printful_){
++		
++		double ft = Scheduler::instance().clock();
++		printf("%d %lf\n", fid_, ft);
++		printful_ = 0;
++	}
++
+         /* W.N.: check if this is from a previous incarnation */
+         if (tcph->ts() < lastreset_) {
+                 // Remove packet and do nothing
+@@ -268,10 +289,13 @@
+ 			 * "fast retransmit phase"), send one entirely new
+ 			 * data packet "to keep the flywheel going".  --Allman
+ 			 */
+-			if (newreno_changes_ > 0 && (dupacks_ % 2) == 1)
++			if (newreno_changes_ > 0 && (dupacks_ % 2) == 1){
+ 				output (t_seqno_++,0);
++				consumePullPkts();		// Jesson, consume one pull packet per one retransmission
++			}
+ 		} else if (dupacks_ < numdupacks_ && singledup_ ) {
+                         send_one();
++			consumePullPkts();              // Jesson, consume one pull packet per one retransmission
+                 }
+ 	}
+         if (tcph->seqno() >= last_ack_)
+@@ -296,6 +320,7 @@
+ 			 *  window of data on exiting Fast Recovery.
+ 			 */
+ 			send_much(0, 0, maxburst_);
++//			restorePullPkts();		// Jesson, increase # of pull pkts.
+ 		}
+ 		else if (dupacks_ > numdupacks_ - 1 && newreno_changes_ == 0)
+ 		{
+diff -ruN ns-2.35/tcp/tcp-sink.cc /home/jesson/workspace/NS_CODE/Homa/ns-allinone-2.35/ns-2.35/tcp/tcp-sink.cc
+--- ns-2.35/tcp/tcp-sink.cc	2010-04-04 04:40:15.000000000 +0800
++++ /home/jesson/workspace/NS_CODE/Homa/ns-allinone-2.35/ns-2.35/tcp/tcp-sink.cc	2018-09-11 07:32:19.149526906 +0800
+@@ -39,6 +39,10 @@
+ #include "tcp-sink.h"
+ #include "hdr_qs.h"
+ 
++// Jesson LIU
++struct NodeQueue* sink_nodes_header_ = NULL;
++struct NodeQueue* sink_nodes_tail_ = NULL;
++
+ static class TcpSinkClass : public TclClass {
+ public:
+ 	TcpSinkClass() : TclClass("Agent/TCPSink") {}
+@@ -177,11 +181,25 @@
+ }
+ 
+ TcpSink::TcpSink(Acker* acker) : Agent(PT_ACK), acker_(acker), save_(NULL),
+-	lastreset_(0.0)
++	lastreset_(0.0), cur_prio_(7)
+ {
+ 	bytes_ = 0; 
+ 	bind("bytes_", &bytes_);
+ 
++	// Jesson LIU, for Homa
++//	bind("th0_", &th0_);
++//	bind("th1_", &th1_);
++//	bind("th2_", &th2_);
++//	bind("th3_", &th3_);
++//	bind("th4_", &th4_);
++//	bind("th5_", &th5_);
++//	bind("th6_", &th6_);
++//	bind("th7_", &th7_);
++
++	bind("pull_interval_", &pull_interval_);
++	bind("nid_", &nid_);
++	pulls_ = new std::deque<Packet*>();
++
+ 	/*
+ 	 * maxSackBlocks_ does wierd tracing things.
+ 	 * don't make it delay-bound yet.
+@@ -204,6 +222,20 @@
+ 	delay_bind_init_one("RFC2581_immediate_ack_");
+ 	delay_bind_init_one("SYN_immediate_ack_");
+ 	delay_bind_init_one("ecn_syn_");
++
++	// Jesson LIU, for Homa
++//	delay_bind_init_one("th0_");
++//	delay_bind_init_one("th1_");
++//	delay_bind_init_one("th2_");
++//	delay_bind_init_one("th3_");
++//	delay_bind_init_one("th4_");
++//	delay_bind_init_one("th5_");
++//	delay_bind_init_one("th6_");
++//	delay_bind_init_one("th7_");
++
++	delay_bind_init_one("pull_interval_");	// Jesson
++	delay_bind_init_one("nid_");		//Jesson
++
+ #if defined(TCP_DELAY_BIND_ALL) && 0
+         delay_bind_init_one("maxSackBlocks_");
+ #endif /* TCP_DELAY_BIND_ALL */
+@@ -222,6 +254,21 @@
+         if (delay_bind_bool(varName, localName, "RFC2581_immediate_ack_", &RFC2581_immediate_ack_, tracer)) return TCL_OK;
+         if (delay_bind_bool(varName, localName, "SYN_immediate_ack_", &SYN_immediate_ack_, tracer)) return TCL_OK;
+ 	if (delay_bind_bool(varName, localName, "ecn_syn_", &ecn_syn_ ,tracer)) return TCL_OK;
++
++	// Jesson LIU, for Homa
++//	if (delay_bind(varName, localName, "th0_", &th0_, tracer)) return TCL_OK;
++//	if (delay_bind(varName, localName, "th1_", &th1_, tracer)) return TCL_OK;
++//	if (delay_bind(varName, localName, "th2_", &th2_, tracer)) return TCL_OK;
++//	if (delay_bind(varName, localName, "th3_", &th3_, tracer)) return TCL_OK;
++//	if (delay_bind(varName, localName, "th4_", &th4_, tracer)) return TCL_OK;
++//	if (delay_bind(varName, localName, "th5_", &th5_, tracer)) return TCL_OK;
++//	if (delay_bind(varName, localName, "th6_", &th6_, tracer)) return TCL_OK;
++//	if (delay_bind(varName, localName, "th7_", &th7_, tracer)) return TCL_OK;
++
++	// Jesson
++	if (delay_bind(varName, localName, "nid_", &nid_, tracer)) return TCL_OK;
++	if (delay_bind(varName, localName, "pull_interval_", &pull_interval_, tracer)) return TCL_OK;
++
+ #if defined(TCP_DELAY_BIND_ALL) && 0
+         if (delay_bind(varName, localName, "maxSackBlocks_", &max_sack_blocks_, tracer)) return TCL_OK;
+ #endif /* TCP_DELAY_BIND_ALL */
+@@ -345,7 +392,26 @@
+         acker_->last_ack_sent_ = ntcp->seqno();
+         // printf("ACK %d ts %f\n", ntcp->seqno(), ntcp->ts_echo());
+ 	
+-	send(npkt, 0);
++	// Jesson, for Homa. Add this ACK to pull queue (pull pkt is the same as grant pkt)
++	hdr_cmn::access(npkt)->ppri() = 0;		// ACK/pull/grant pkts are the highest priority pkts
++	addToPullQueue(npkt);
++	// update the current priority of this flow
++	short prio = hdr_cmn::access(opkt)->ppri();
++	if(prio<cur_prio_){
++		cur_prio_ = prio;
++		// need to update the priority in PullQueueTimer queue
++		struct NodeQueue* q = findNodeQueue(this->nid_);
++
++		// you can choose opt-out of priority queue ajustment, because it consumes more cpu resources and costs too much time to finish the simulation.
++		if(q){
++			q->pull_timer_->upgradeACKs(this, this->cur_prio_);
++		}else{
++			// no ACKs in queue, no need to prioritize those enqueued pkts
++		}
++	}
++
++	//----removed by Jesson LIU, for homa grants control------
++	// send(npkt, 0);
+ 	// send it
+ }
+ 
+@@ -385,6 +451,32 @@
+ 	// remove it from the system
+ }
+ 
++	// Jesson LIU, for Homa
++/*short TcpSink::getPriority(int pkts){
++
++	short pri = 0;
++
++	if(pkts<this->th0_){
++		pri = 0;
++	}else if(pkts>this->th0_ && pkts<this->th1_){
++		pri = 1;
++	}else if(pkts>this->th1_ && pkts<this->th2_){
++		pri = 2;
++	}else if(pkts>this->th2_ && pkts<this->th3_){
++		pri = 3;
++	}else if(pkts>this->th3_ && pkts<this->th4_){
++		pri = 4;
++	}else if(pkts>this->th4_ && pkts<this->th5_){
++		pri = 5;
++	}else if(pkts>this->th5_ && pkts<this->th6_){
++		pri = 6;
++	}else{
++		pri = 7;
++	}
++
++	return pri;
++}*/
++
+ static class DelSinkClass : public TclClass {
+ public:
+ 	DelSinkClass() : TclClass("Agent/TCPSink/DelAck") {}
+@@ -756,3 +848,137 @@
+ 	// change the size of the common header to account for the
+ 	// Sack strings (2 4-byte words for each element)
+ }
++
++
++/* Jesson Liu, for pull queue control
++ * 
++ * Send a pull packet from pull queue
++ */
++
++struct NodeQueue* findNodeQueue(int nid){
++	
++	struct NodeQueue* cur = sink_nodes_header_;
++	while(cur){
++		
++		if(cur->nid_ == nid){
++
++			return cur;
++		}
++
++		cur = cur->next_;
++	}
++	
++	return NULL;
++}
++
++void PullQueueTimer::expire(Event*){
++	
++	// send a ACK from non-zero-pkt highest priorities queue
++	for(int i=0; i<MAX_QUEUE_NUM; i++){
++
++		if(this->queue_[i]->size()>0){
++			TcpSink* temp = this->queue_[i]->front();
++//			this->queue_[i]->front()->sendACK();
++			temp->sendACK();
++//			this->interval_ = this->queue_[i]->front()->pull_interval_;
++			this->interval_ = temp->pull_interval_;
++			this->queue_[i]->pop_front();
++
++//			double now = Scheduler::instance().clock();
++//			printf("%lf: fid-%d, w/ interval:%lf\n", now, temp->getFid(), this->interval_);
++
++			break;
++		}
++	}
++	this->resched(interval_);
++}
++
++void PullQueueTimer::ackEnqueue(TcpSink* s, int qid){
++
++	this->queue_[qid]->push_back(s);	
++	//double now = Scheduler::instance().clock();
++	//printf("%lf: fid-qid:%d-%d, len:%d\n", now, s->getFid(), qid, this->queue_[qid]->size());
++}
++
++void PullQueueTimer::upgradeACKs(TcpSink* s, int qid){
++	// NOTICE: finished by can be opt-out
++	
++	std::deque<TcpSink*> *temp_que = new std::deque<TcpSink*>();
++
++	for(int i=(qid+1); i<MAX_QUEUE_NUM; i++){
++		// Get those ACKs
++		std::deque<TcpSink*> *temp_pri = new std::deque<TcpSink*>();
++
++		while(this->queue_[i]->size()>0){
++			
++			TcpSink* ts = this->queue_[i]->front();
++			this->queue_[i]->pop_front();
++			if(ts==s){
++				temp_que->push_back(ts);
++				continue;
++			}
++			temp_pri->push_back(ts);
++		}
++		delete queue_[i];
++		queue_[i] = temp_pri;
++	}	
++
++	while(temp_que->size()>0){
++		// upgrade those ACKs
++		TcpSink* ts = temp_que->front();
++		temp_que->pop_front();
++		this->queue_[qid]->push_back(ts);
++	}
++	delete temp_que;
++}
++
++void TcpSink::addToPullQueue(Packet* pkt){
++
++	this->pulls_->push_back(pkt);
++	// find the correct NodeQueue and add this TcpSink	
++	struct NodeQueue* q = findNodeQueue(this->nid_);
++
++//	printf("fid:%d, grants enqueue\n", this->fid_);
++	if(q){
++		q->pull_timer_->ackEnqueue(this, this->cur_prio_);
++	}else{
++		// not found, new one
++		struct NodeQueue *nque = new struct NodeQueue;
++		nque->pull_timer_ = new PullQueueTimer();
++		nque->nid_ = this->nid_;
++		
++		nque->pull_timer_->isStarted_ = 1;
++		nque->pull_timer_->interval_ = this->pull_interval_;
++		nque->pull_timer_->resched(this->pull_interval_);
++		nque->next_ = NULL;
++
++		if(sink_nodes_header_==NULL){
++
++			sink_nodes_header_ = nque;
++			sink_nodes_tail_ = nque;
++		}
++
++		sink_nodes_tail_->next_ = nque;
++		sink_nodes_tail_ = nque;
++		nque->pull_timer_->ackEnqueue(this, this->cur_prio_);
++	}
++}
++
++
++void TcpSink::sendACK(){
++	
++	//printf("fid:%d, pull queue size:%d\n", fid_, this->pulls_->size());
++	if(this->pulls_->size()>0){
++
++//		printf("fid:%d, pull one\n", fid_);	
++	
++		Packet* opkt = this->pulls_->front();
++
++//		double now = Scheduler::instance().clock();
++//		printf("%lf: fid:%d @ seqno:%d, w/ interval:%lf\n", now, this->fid_, this->acker_->Seqno(), this->pull_interval_);
++
++		send(opkt, 0);
++		this->pulls_->pop_front();
++	}
++
++}
+diff -ruN ns-2.35/tcp/tcp-sink.h /home/jesson/workspace/NS_CODE/Homa/ns-allinone-2.35/ns-2.35/tcp/tcp-sink.h
+--- ns-2.35/tcp/tcp-sink.h	2010-04-04 04:40:15.000000000 +0800
++++ /home/jesson/workspace/NS_CODE/Homa/ns-allinone-2.35/ns-2.35/tcp/tcp-sink.h	2018-09-11 04:45:30.385495352 +0800
+@@ -36,6 +36,8 @@
+ #ifndef ns_tcpsink_h
+ #define ns_tcpsink_h
+ 
++//Jesson
++#include <deque>
+ #include <math.h>
+ #include "agent.h"
+ #include "tcp.h"
+@@ -46,12 +48,54 @@
+ #define MWM (MWS-1)
+ #define HS_MWS 65536
+ #define HS_MWM (MWS-1)
++
++#define MAX_QUEUE_NUM 8
++
+ /* For Tahoe TCP, the "window" parameter, representing the receiver's
+  * advertised window, should be less than MWM.  For Reno TCP, the
+  * "window" parameter should be less than MWM/2.
+  */
+ 
+ class TcpSink;
++
++/* @author Jesson LIU
++ * use this timer to pace the ACKs in the pull queue
++ * pacing interval are defined in TcpSink
++ */
++class PullQueueTimer : public TimerHandler {
++
++public:
++	PullQueueTimer() : TimerHandler() {
++	
++		isStarted_=0;
++		queue_ = new std::deque<TcpSink*>*[MAX_QUEUE_NUM];
++
++		for(int i=0; i<MAX_QUEUE_NUM; i++){
++		
++			queue_[i]=new std::deque<TcpSink*>();
++		}
++	}
++	short isStarted_;
++	void ackEnqueue(TcpSink*, int);
++	void upgradeACKs(TcpSink*, int);
++	double interval_;
++protected:
++	virtual void expire(Event *e);
++	std::deque<TcpSink*> **queue_;
++};
++
++struct NodeQueue{
++	
++	int nid_;
++	PullQueueTimer* pull_timer_;
++	struct NodeQueue* next_;
++};
++
++extern struct NodeQueue* sink_nodes_header_;            // periodical scheduling of pull packets
++extern struct NodeQueue* sink_nodes_tail_;		// Jesson Liu, the pointer of the timer tail
++
++struct NodeQueue* findNodeQueue(int nid);
++
+ class Acker {
+ public:
+ 	Acker();
+@@ -76,6 +120,7 @@
+ 	int *seen_;		/* array of packets seen */
+ 	double ts_to_echo_;	/* timestamp to echo to peer */
+ 	int is_dup_;		// A duplicate packet.
++
+ public:
+         int last_ack_sent_;     // For updating timestamps, from Andrei Gurtov.
+ };
+@@ -104,6 +149,12 @@
+ 	void reset();
+ 	int command(int argc, const char*const* argv);
+ 	TracedInt& maxsackblocks() { return max_sack_blocks_; }
++
++	// Jesson Liu, for pull queue control
++	double pull_interval_;
++	void sendACK();	
++	int getFid(){ return fid_;}
++
+ protected:
+ 	void ack(Packet*);
+ 	virtual void add_to_ack(Packet* pkt);
+@@ -130,6 +181,25 @@
+ 				/* from previous incarnations */
+         int ecn_syn_;           /* allow SYN/ACK packets to be ECN-capable */
+ 
++//	/* @author Jesson LIU, for Homa implementation
++//	 * the thresholds for priorities
++//	 */
++//	int th0_;
++//	int th1_;
++//	int th2_;
++//	int th3_;
++//	int th4_;
++//	int th5_;
++//	int th6_;
++//	int th7_;
++	
++//	short getPriority(int);
++
++	// Jesson LIU
++	std::deque<Packet*>* pulls_;		// pull queue
++	void addToPullQueue(Packet* pkt);
++	int nid_;				// the id of the belonged node
++	short cur_prio_;			// the current priority of this flow
+ };
+ 
+ class DelAckSink;

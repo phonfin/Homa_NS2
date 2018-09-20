@@ -1,0 +1,4 @@
+All the '.patch' file should be used on original ns-2.35.
+COMMAND:
+1. put '.patch' file inside ns-2.35 folder
+2. type 'patch -p1 --ignore-whitespace -i HOMA_vx.x.patch'
