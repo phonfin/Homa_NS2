@@ -909,13 +909,15 @@ diff -ruN ns-2.35/tcp/tcp-sink.cc /home/jesson/workspace/NS_CODE/Homa/ns-allinon
 +		nque->next_ = NULL;
 +
 +		if(sink_nodes_header_==NULL){
-+
++  // the first element
 +			sink_nodes_header_ = nque;
 +			sink_nodes_tail_ = nque;
-+		}
++		}else{
++  // add another element
++		 sink_nodes_tail_->next_ = nque;
++		 sink_nodes_tail_ = nque;
++  }
 +
-+		sink_nodes_tail_->next_ = nque;
-+		sink_nodes_tail_ = nque;
 +		nque->pull_timer_->ackEnqueue(this, this->cur_prio_);
 +	}
 +}
